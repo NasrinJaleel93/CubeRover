@@ -4,11 +4,17 @@
       <h2>
 <a id="welcome-to-github-pages" class="anchor" href="#welcome-to-github-pages" aria-hidden="true"><span class="octicon octicon-link"></span></a><b>Progress</b></h2>
 
-<h3> Hardware setup </h3>
+<h3> Environment Setup (3 - 5 April) </h3>
 
-<p> As outlined in our proposal, our plan is to first have the odometry (tracking) and loop closure parts of the system full working and parallelized before we descent onto generating depth maps for a monocular camera. To obtain depth maps to work with in the beginning, we use the Kinect for Xbox 360, which generates RGB and depth images.
+<p> As outlined in our proposal, our plan is to first have the odometry (tracking) and loop closure parts of the system full working and parallelized before we descent onto generating depth maps for a monocular camera. To obtain depth maps to work with in the beginning, we use the Kinect for Xbox 360, which generates RGB and depth images. </p>
 
-The Tegra K1 we took from Kayvon <p>
+<p> We borrowed Kayvon's Jetson Tegra K1 development kit for the project. We access the Tegra K1 by connecting it to the internet via Ethernet, and ssh-ing into it from a machine connected to the same LAN. The Tegra K1 had been flashed with the Linux for Tegra (L4T) release R19. So we installed the following software on the Tegra: </p>
+<ul>
+	<li> CUDA Toolkit 6.0 </li>
+	<li> OpenCV 2.4.9 </li>
+	<li> OpenKinect's libfreenect library </li>
+</ul>
+<p> We managed to get libfreenect working with the Kinect, and subsequently with OpenCV as well. We now have RGB and depth images streaming from the Kinect using OpenCV code. The next steps will be to explore OpenCV's CUDA packages to avoid implementing any redundant functions. At any rate, we will look to improve the OpenCV implementations. We will also try to chart out a pseudo-code for the tracking algorithm, and begin its basic implementation soon. </p>
 
       <footer class="site-footer">
         <span class="site-footer-owner"><a href="https://github.com/uprasad/CubeRover">CubeRover</a> is maintained by <a href="https://github.com/uprasad">uprasad</a> & <a href="https://github.com/nikithashr">nikithashr</a>.</span>
