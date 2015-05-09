@@ -101,10 +101,6 @@ Using the image coordinates and the true depth values, we can construct the 3D c
   </ol>
 </p>
 
-<div class = "box">
-    <img src="img/warpResult.png" />
-</div>
-
 
 <h3> Refining the motion parameters (ksi: &xi;) </h3>
   <p> Each call to recompute Ksi does the following:
@@ -113,6 +109,44 @@ Using the image coordinates and the true depth values, we can construct the 3D c
     <li>Use the derivatives, the cloud points and the camera properties to solve linear equations over the sets of correspondences.</li>
   </ol>
   </p>
+
+<h3> Performance </h3>
+
+<div class = "box">
+    <img src="img/warpResult.png" />
+</div>
+
+<p>
+  The above set of images shows the result of using the estimated motion parameters to warp the image at time <i>t</i>. We can see that from time <i>t</i> to time <i>t+1</i> the camera has been translated to the bottom and left. The warped image accurately reflects that motion.
+</p>
+
+<div>
+  <img src="img/resultsInd.png" />
+</div>
+
+<p>
+  The bar graph above compares the performances the parallel and serial versions of a few parts of the algorithm. The serial version has been taken from the contrib/ module of OpenCV. Our parallel algorithm is also based on it.
+</p>
+
+<p>
+  'Compute correspondences' is the step of the algorithm that uses inverse projections and gradient thresholding to compute a set of correspondences. These correspondences are then used later in the 'Sigma' step of the algorithm to calculate the squared error between the two images. The results of 'Sigma' and 'Compute correspondences' is then encoded as a set of linear equations, which are solved in the 'Rigid Body' step to compute the rigid body transform between two camera views.
+</p>
+
+<div align="center">
+  <img src="img/results.png" />
+</div>
+
+<p>
+  This bar graph compares the total running times of the two algorithms. Estimating the rigid body transform between two frames takes nearly 800 milliseconds with the serial version, which means that we can process image streams at about 1.2 frames per second.
+</p>
+
+<p>
+  We have managed to improve this frame rate to about 2 frames per second. This is far from real-time, but is adequate for several slow moving robots. The CubeRover, for example, moves at 15 centimeters per second. Moreover, we feel that without significant changes to the algorithm itself, it is very challenging to extract more parallelism out of Dense RGB-D odometry, due in no small part to the inherent serial nature of the algorithm (iterative refinement).
+</p>
+
+<p>
+  We will present cogent arguments defending this stance in our final presentation.
+</p>
 
 <h3>
 <a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>References<a name="ref"></a></h3>
