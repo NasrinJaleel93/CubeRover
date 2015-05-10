@@ -7,9 +7,16 @@ all:
 clean:
 	rm -rf objs/
 	rm rgbd.out
+	rm *.log
 
 run1:
 	./rgbd.out rgbdodometry/image_00000.png rgbdodometry/depth_00000.png rgbdodometry/image_00002.png rgbdodometry/depth_00002.png
 
 run2:
 	./rgbd.out rgbdodometry/snapshot0.jpg rgbdodometry/d_snapshot0.jpg rgbdodometry/snapshot1.jpg rgbdodometry/d_snapshot1.jpg
+
+trace:
+	nvprof --log-file trace.log --print-gpu-trace ./rgbd.out rgbdodometry/image_00000.png rgbdodometry/depth_00000.png rgbdodometry/image_00002.png rgbdodometry/depth_00002.png 
+
+profile:
+	nvprof --log-file profile.log ./rgbd.out rgbdodometry/image_00000.png rgbdodometry/depth_00000.png rgbdodometry/image_00002.png rgbdodometry/depth_00002.png 

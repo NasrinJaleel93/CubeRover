@@ -3,6 +3,8 @@
 #include "opencv2/contrib/contrib.hpp"
 #include "opencv2/highgui/highgui.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdio>
 #include <iostream>
 #include <ctime>
@@ -79,10 +81,21 @@ static void warpImage( const Mat& image, const Mat& depth,
 
 int main(int argc, char** argv)
 {
+
+	// Init CUDA
+	cudaFree(0);
+	int device;
+	cudaGetDevice(&device);
+	cudaSetDevice(device);
+
     float vals[] = {525., 0., 3.1950000000000000e+02,
                     0., 525., 2.3950000000000000e+02,
                     0., 0., 1.};
-
+/*
+	float vals[] = {523.56375, 0., 3.2203666e+02,
+					0., 523.34835, 2.3144145e+02,
+					0., 0., 1.};
+*/
     const Mat cameraMatrix = Mat(3,3,CV_32FC1,vals);
     const Mat distCoeff(1,5,CV_32FC1,Scalar(0));
 
@@ -165,7 +178,10 @@ int main(int argc, char** argv)
                                      cameraMatrix, minDepth, maxDepth, maxDepthDiff,
                                      iterCounts, minGradMagnitudes, transformationType );
 	*/
-    bool isFound = RGBDOdometry418( Rt, Mat(),
+	int repeat = 50;
+	bool isFound;
+	for (int i=0; i<repeat; ++i)
+    isFound = RGBDOdometry418( Rt, Mat(),
                                      grayImage0, depthFlt0, Mat(),
                                      grayImage1, depthFlt1, Mat(),
                                      cameraMatrix, minDepth, maxDepth, maxDepthDiff,
@@ -173,7 +189,7 @@ int main(int argc, char** argv)
     tm.stop();
 
     cout << "Rt = " << Rt << endl;
-    cout << "Time = " << tm.getTimeSec() << " sec." << endl;
+    cout << "Time = " << tm.getTimeSec()/repeat << " sec." << endl;
 
     if( !isFound )
     {
@@ -186,6 +202,9 @@ int main(int argc, char** argv)
 
     imshow( "image0", colorImage0 );
     imshow( "warped_image0", warpedImage0 );
+
+	imwrite("warped.png", warpedImage0);
+
     imshow( "image1", colorImage1 );
     waitKey();
 

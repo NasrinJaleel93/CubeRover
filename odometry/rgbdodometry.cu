@@ -22,9 +22,13 @@
 #include <Eigen/Dense>
 #endif
 
-#define THREADS_PER_BLOCK 64 // 8 x 8 = 64
-#define TPB_X 8 //cols
-#define TPB_Y 8 //rows
+#include <string>
+
+#define THREADS_PER_BLOCK 256 // 8 x 8 = 64
+#define TPB_X 16 //cols
+#define TPB_Y 16 //rows
+
+#define ALLOC_ZEROCOPY 2
 
 /* given the number of threads per block (tpb) and the image dimensions
    we calculate the width of a grid */
@@ -105,8 +109,21 @@ void gpuMatImshow(gpu::GpuMat gpuMat) {
 	waitKey();
 }
 
+void gpuMatImwrite(gpu::GpuMat gpuMat, string name) {
+	Mat cpuMat;
+	gpuMat.download(cpuMat);
+	imwrite(name + ".png", cpuMat);
+}
+
+void gpuMatCout(gpu::GpuMat gpuMat, string name) {
+	Mat cpuMat;
+	gpuMat.download(cpuMat);
+	cout << name << endl;
+	cout << cpuMat << endl;
+}
+
 __global__ void gpuPreprocessDepthKernel (gpu::PtrStepSz<float> gpuDepth0, gpu::PtrStepSz<float> gpuDepth1,
-						const gpu::PtrStepSz<uchar>& gpuValidMask0, const gpu::PtrStepSz<uchar>& gpuValidMask1,
+						// const gpu::PtrStepSz<uchar>& gpuValidMask0, const gpu::PtrStepSz<uchar>& gpuValidMask1,
 						float minDepth, float maxDepth ) {
 	int x = threadIdx.x + blockIdx.x * blockDim.x;
 	int y = threadIdx.y + blockIdx.y * blockDim.y;
@@ -117,18 +134,17 @@ __global__ void gpuPreprocessDepthKernel (gpu::PtrStepSz<float> gpuDepth0, gpu::
     float d0 = gpuDepth0(y,x);
 	float d1 = gpuDepth1(y,x);
 
-	if (!isnan(d0) && (d0 > maxDepth || d0 < minDepth || d0 <= 0 ))
-			//|| (gpuValidMask0.rows != 0 && gpuValidMask0.cols !=0)  && !gpuValidMask0(y,x)))
-		gpuDepth0(y,x) = CUDART_NAN_F; 
+	if (!isnan(d0) && (d0 > maxDepth || d0 < minDepth || d0 <= 0 )) {
+		gpuDepth0(y,x) = CUDART_NAN_F;
+	}
 
-    if (!isnan(d1) && (d1 > maxDepth || d1 < minDepth || d1 <= 0 ))
-			//|| (gpuValidMask1.rows != 0 && gpuValidMask1.cols !=0)  && !gpuValidMask1(y,x)))
+    if (!isnan(d1) && (d1 > maxDepth || d1 < minDepth || d1 <= 0 )) {
 		gpuDepth1(y,x) = CUDART_NAN_F;
+	}
 }
 
 void gpuBuildPyramid (const gpu::GpuMat& gpuImage, vector<gpu::GpuMat>& gpuPyramidImage,
 					  int maxLevel ) {
-	// gpuPyramidImage.resize(maxLevel+1);
 	gpuPyramidImage.push_back(gpuImage);
 
 	for (int i=1; i<=maxLevel; i++) {
@@ -139,24 +155,66 @@ void gpuBuildPyramid (const gpu::GpuMat& gpuImage, vector<gpu::GpuMat>& gpuPyram
 
 }
 
-__global__ void gpuSetTexturedMaskKernel (const gpu::PtrStepSz<float> dx, const gpu::PtrStepSz<float> dy, 
-										  gpu::PtrStepSz<uchar> gpuTexturedMask, 
-										  const float minScalesGradMagnitude2) {
+__global__ void gpuSobelKernel (const gpu::PtrStepSz<uchar> gpuPyramidImage1_t,
+							    gpu::PtrStepSz<float> gpuPyramid_dI_dx1, gpu::PtrStepSz<float> gpuPyramid_dI_dy1,
+								gpu::PtrStepSz<uchar> gpuTexturedMask, const float minScalesGradMagnitude2,
+								gpu::PtrStepSz<float> gpuDepth0, gpu::PtrStepSz<float> gpuDepth1,
+								float minDepth, float maxDepth, gpu::PtrStepSz<float3> gpuCloud,
+								const double inv_fx, const double inv_fy, const double ox, const double oy) {
 
 	int x = threadIdx.x + blockIdx.x * blockDim.x;
 	int y = threadIdx.y + blockIdx.y * blockDim.y;
 
-	// invalid pixel coordinates
-	if (x >= dx.cols || y >= dx.rows)
+	int boundSizeX = gpuPyramidImage1_t.cols;
+	int boundSizeY = gpuPyramidImage1_t.rows;
+
+	if (x >= boundSizeX-1 || y >= boundSizeY-1 || x == 0 || y == 0)
 		return;
 
-	// set texturedmask to high if the gradient crosses a threshold
+	gpuPyramid_dI_dy1(y,x) = gpuPyramidImage1_t(y+1, x-1) + 2 * gpuPyramidImage1_t(y+1, x) 
+					+ gpuPyramidImage1_t(y+1, x+1) - gpuPyramidImage1_t(y-1, x-1) 
+					- 2 * gpuPyramidImage1_t(y-1, x) - gpuPyramidImage1_t(y-1, x+1);
+
+	gpuPyramid_dI_dx1(y,x) = gpuPyramidImage1_t(y-1, x+1) + 2 * gpuPyramidImage1_t(y, x+1) 
+					+ gpuPyramidImage1_t(y+1, x+1) - gpuPyramidImage1_t(y-1, x-1) 
+					- 2 * gpuPyramidImage1_t(y, x-1) - gpuPyramidImage1_t(y+1, x-1);
+
 	float m2;
-	m2 = (float)((dx(y,x) * dx(y,x)) + (dy(y,x) * dy(y,x)));
-	if (m2 >= minScalesGradMagnitude2) 
-		gpuTexturedMask(y,x) = 255;
+	m2 = (float)((gpuPyramid_dI_dx1(y,x) * gpuPyramid_dI_dx1(y,x)) 
+			+ (gpuPyramid_dI_dy1(y,x) * gpuPyramid_dI_dy1(y,x)));
+
+		gpuTexturedMask(y,x) = 255 * (m2 >= minScalesGradMagnitude2);
+	float z = gpuDepth0(y,x);
+	float cloudPtr_x = (float)((x - ox) * z * inv_fx);
+	float cloudPtr_y = (float)((y - oy) * z * inv_fy);
+	gpuCloud(y,x) = make_float3(cloudPtr_x, cloudPtr_y, z);
+
 }
 
+void gpuSobel (const gpu::GpuMat& gpuPyramidImage1_t, gpu::GpuMat& gpuPyramid_dI_dx1, 
+			   gpu::GpuMat& gpuPyramid_dI_dy1, gpu::GpuMat& gpuTexturedMask,
+			   int SobelSize, const float minScalesGradMagnitude2,
+			   gpu::GpuMat& gpuPyramidDepth0, gpu::GpuMat& gpuPyramidDepth1,
+			   float minDepth, float maxDepth, gpu::GpuMat& gpuCloud, Mat cameraMatrix) {
+
+	if (SobelSize !=3 )
+		return;
+
+	const double inv_fx = 1.f / cameraMatrix.at<double>(0,0);
+	const double inv_fy = 1.f / cameraMatrix.at<double>(1,1);
+
+	const double ox = cameraMatrix.at<double>(0,2);
+	const double oy = cameraMatrix.at<double>(1,2);
+
+	dim3 blockDim (TPB_X, TPB_Y);
+	dim3 gridDim (GRID_COLS(gpuPyramidImage1_t.cols), GRID_ROWS(gpuPyramidImage1_t.rows));
+
+	gpuSobelKernel<<< gridDim, blockDim >>>(gpuPyramidImage1_t, gpuPyramid_dI_dx1,
+						gpuPyramid_dI_dy1, gpuTexturedMask, minScalesGradMagnitude2,
+						gpuPyramidDepth0, gpuPyramidDepth1, minDepth, maxDepth, gpuCloud,
+						inv_fx, inv_fy, ox, oy);
+
+}
 
 void gpuBuildPyramids (const gpu::GpuMat& gpuImage0, const gpu::GpuMat& gpuImage1,
 					   const gpu::GpuMat& gpuDepth0, const gpu::GpuMat& gpuDepth1,
@@ -165,8 +223,8 @@ void gpuBuildPyramids (const gpu::GpuMat& gpuImage0, const gpu::GpuMat& gpuImage
 				       vector<gpu::GpuMat>& gpuPyramidImage0, vector<gpu::GpuMat>& gpuPyramidDepth0,
 					   vector<gpu::GpuMat>& gpuPyramidImage1, vector<gpu::GpuMat>& gpuPyramidDepth1,
 				       vector<gpu::GpuMat>& gpuPyramid_dI_dx1, vector<gpu::GpuMat>& gpuPyramid_dI_dy1,
-					   vector<gpu::GpuMat>& gpuPyramidTexturedMask1,
-					   vector<gpu::GpuMat>& gpuPyramidCameraMatrix, Mat cameraMatrix) {
+					   vector<gpu::GpuMat>& gpuPyramidTexturedMask1, vector<Mat>& pyramidCameraMatrix, 
+					   Mat cameraMatrix, float minDepth, float maxDepth, vector<gpu::GpuMat>& gpuPyramidCloud0) {
 
 	const int pyramidMaxLevel = (int) minGradMagnitudes.size() - 1;
 
@@ -177,59 +235,50 @@ void gpuBuildPyramids (const gpu::GpuMat& gpuImage0, const gpu::GpuMat& gpuImage
 	// build downsampled depth images - downsampled by half
 	gpuBuildPyramid( gpuDepth0, gpuPyramidDepth0, pyramidMaxLevel);
 	gpuBuildPyramid( gpuDepth1, gpuPyramidDepth1, pyramidMaxLevel);
-	
+
 	// resize gradient to number of pyramid level
 	gpuPyramid_dI_dx1.resize (gpuPyramidImage1.size());
 	gpuPyramid_dI_dy1.resize (gpuPyramidImage1.size());
 	gpuPyramidTexturedMask1.resize (gpuPyramidImage1.size());
 
-	gpuPyramidCameraMatrix.reserve (gpuPyramidImage1.size());
+	gpuPyramidCloud0.resize (gpuPyramidImage1.size());
 
-	vector<Mat> pyramidCameraMatrix;
 	pyramidCameraMatrix.reserve(gpuPyramidImage1.size());
 
 	Mat cameraMatrix_dbl;
 	cameraMatrix.convertTo(cameraMatrix_dbl, CV_64FC1);
-
 	// loop over the pyramid levels
 	for (size_t t = 0; t < gpuPyramidImage1.size() ; t++) {
+		Mat levelCameraMatrix = ((t == 0) ? cameraMatrix_dbl : 0.5f * pyramidCameraMatrix[t-1]);
+		levelCameraMatrix.at<double>(2,2) = 1.;
+		pyramidCameraMatrix.push_back(levelCameraMatrix);
 
-		// find gradients in x- and y- directions using Sobel
-		gpu::Sobel (gpuPyramidImage1[t], gpuPyramid_dI_dx1[t], CV_32F, 1, 0, sobelSize);
-		gpu::Sobel (gpuPyramidImage1[t], gpuPyramid_dI_dy1[t], CV_32F, 0, 1, sobelSize);
+		gpu::GpuMat dI_dx1(gpuPyramidImage1[t].size(), CV_32FC1);
+		gpu::GpuMat dI_dy1(gpuPyramidImage1[t].size(), CV_32FC1);
 
-		const gpu::GpuMat dx = gpuPyramid_dI_dx1[t];
-		const gpu::GpuMat dy = gpuPyramid_dI_dy1[t];
-
-		gpu::GpuMat gpuTexturedMask(dx.size(), CV_8UC1, Scalar(0));
+		gpu::GpuMat gpuTexturedMask(gpuPyramidImage1[t].size(), CV_8UC1);
+		gpu::GpuMat gpuCloud0(gpuPyramidDepth0[t].size(), CV_32FC3);
 
 		// calculate the minimum scaled gradient magnitude
 		const float minScalesGradMagnitude2 =
 			(float)((minGradMagnitudes[t] * minGradMagnitudes[t]) / (sobelScale * sobelScale));
 
-		dim3 blockDim (TPB_X, TPB_Y);
-		dim3 gridDim (GRID_COLS(dx.cols), GRID_ROWS(dx.rows));
+		gpuSobel (gpuPyramidImage1[t], dI_dx1, dI_dy1, gpuTexturedMask, sobelSize, minScalesGradMagnitude2,
+				  gpuPyramidDepth0[t], gpuPyramidDepth1[t], minDepth, maxDepth, gpuCloud0, levelCameraMatrix);
+		gpuPyramid_dI_dx1[t] = dI_dx1;
+		gpuPyramid_dI_dy1[t] = dI_dy1;
 
-		gpuSetTexturedMaskKernel<<< gridDim, blockDim >>>(dx, dy, gpuTexturedMask, minScalesGradMagnitude2);
-		cudaDeviceSynchronize();
+		gpuPyramidCloud0[t] = gpuCloud0;
 
 		// do the intricate operations on CPU, and then upload to GPU
 		gpuPyramidTexturedMask1[t] = gpuTexturedMask;
 
-		Mat levelCameraMatrix = ((t == 0) ? cameraMatrix_dbl : 0.5f * pyramidCameraMatrix[t-1]);
-		levelCameraMatrix.at<double>(2,2) = 1.;
-		pyramidCameraMatrix.push_back(levelCameraMatrix);
-
-		gpu::GpuMat gpuLevelCameraMatrix;
-		gpuLevelCameraMatrix.upload(levelCameraMatrix);
-		gpuPyramidCameraMatrix.push_back(gpuLevelCameraMatrix);
 	}
 }
 
  
 
 void gpuPreprocessDepth( gpu::PtrStepSz<float> gpuDepth0, gpu::PtrStepSz<float> gpuDepth1,
-						const gpu::PtrStepSz<uchar>& gpuValidMask0, const gpu::PtrStepSz<uchar>& gpuValidMask1,
 						float minDepth, float maxDepth ) {
 	// some sanity checks
 	CV_Assert( gpuDepth0.rows == gpuDepth1.rows );
@@ -238,9 +287,8 @@ void gpuPreprocessDepth( gpu::PtrStepSz<float> gpuDepth0, gpu::PtrStepSz<float> 
 	dim3 blockDim (TPB_X, TPB_Y);
 	dim3 gridDim (GRID_COLS(gpuDepth0.cols), GRID_ROWS(gpuDepth0.rows));
 
-    gpuPreprocessDepthKernel <<<gridDim, blockDim>>>(gpuDepth0, gpuDepth1, gpuValidMask0, gpuValidMask1, 
-													 minDepth, maxDepth); 
-	cudaDeviceSynchronize();
+    gpuPreprocessDepthKernel <<<gridDim, blockDim>>>(gpuDepth0, gpuDepth1,// gpuValidMask0, gpuValidMask1, 
+													 minDepth, maxDepth);
 
 }
 
@@ -276,16 +324,14 @@ void gpuCvtDepth2Cloud (const gpu::GpuMat& gpuPyramidDepth,
 
 	gpuCvtDepth2CloudKernel <<<gridDim, blockDim>>>(gpuCloud, inv_fx, inv_fy, ox, oy, 
 													gpuPyramidDepth);
-	cudaDeviceSynchronize();
 
 	int countNonZero = gpu::countNonZero(gpuPyramidDepth);
-	// int sizeGpu = gpuPyramidDepth.cols * gpuPyramidDepth.rows;
 
 }
 
 __global__ void gpuComputeCorrespKernel(const gpu::PtrStepSz<float> gpuDepth0, const gpu::PtrStepSz<float> gpuDepth1,
 		const gpu::PtrStepSz<uchar> gpuTexturedMask1, gpu::PtrStepSz<int2> corresps, const double * KRK_inv_ptr, const double * Kt_ptr, 
-		gpu::PtrStepSz<int> gpuCorrespCountMat, float maxDepthDiff) {
+		int* gpuCorrespCount, float maxDepthDiff) {
 
 	int x = threadIdx.x + blockIdx.x * blockDim.x;
 	int y = threadIdx.y + blockIdx.y * blockDim.y;
@@ -307,38 +353,33 @@ __global__ void gpuComputeCorrespKernel(const gpu::PtrStepSz<float> gpuDepth0, c
 			float d0 = gpuDepth0(v0, u0);
 
 			if (!isnan(d0) && fabsf(transformed_d1 - d0) <= maxDepthDiff) {
-				int2 c = corresps(v0, u0);
-				if (c.x != -1 && c.y != -1) {
-					int exist_u1, exist_v1;
-					exist_u1 = c.x;
-					exist_v1 = c.y;
-					
-					float exist_d1 = (float)(gpuDepth1(exist_v1, exist_u1) * (KRK_inv_ptr[6] * exist_u1 + KRK_inv_ptr[7] * exist_v1 + KRK_inv_ptr[8]) + Kt_ptr[2]);
 
-					if (transformed_d1 > exist_d1)
-						return;
-				} else {
-					gpuCorrespCountMat(v0, u0) = gpuCorrespCountMat(v0, u0) + 1;
-				}
+				int threadCorresp = atomicAdd(gpuCorrespCount, 1);
+
+				int2 corrKey;
+				corrKey.x = u0;
+				corrKey.y = v0;
 
 				int2 corr;
 				corr.x = x;
 				corr.y = y;
-				corresps(v0, u0) = corr;
+
+				corresps(threadCorresp, 0) = corrKey;
+				corresps(threadCorresp, 1) = corr;
 			}
 		}
 	}
 
 }
 
-gpu::GpuMat gpuComputeCorresp(const Mat& K, const Mat& K_inv, const Mat& Rt,
+int gpuComputeCorresp(const Mat& K, const Mat& K_inv, const Mat& Rt,
 		const gpu::GpuMat& gpuDepth0, const gpu::GpuMat& gpuDepth1, const gpu::GpuMat& gpuTexturedMask1,
 		float maxDepthDiff, gpu::GpuMat& corresps) {
 	CV_Assert( K.type() == CV_64FC1 );
 	CV_Assert( K_inv.type() == CV_64FC1 );
 	CV_Assert( Rt.type() == CV_64FC1 );
 
-	corresps.create( gpuDepth1.size(), CV_32SC2 );
+	corresps.create( gpuDepth1.rows*gpuDepth1.cols, 2, CV_32SC2);
 
 	Mat R = Rt(Rect(0, 0, 3, 3)).clone();
 
@@ -359,44 +400,37 @@ gpu::GpuMat gpuComputeCorresp(const Mat& K, const Mat& K_inv, const Mat& Rt,
 	cudaMalloc((void**)&gpuKt_ptr, 3 * sizeof(double));
 	cudaMemcpy(gpuKt_ptr, Kt_ptr, 3 * sizeof(double), cudaMemcpyHostToDevice);
 
-	corresps = Scalar(-1, -1);
+	int correspCount = 0;
+	int* gpuCorrespCount;
+	cudaMalloc((void**)&gpuCorrespCount, sizeof(int));
+	cudaMemcpy(gpuCorrespCount, &correspCount, sizeof(int), cudaMemcpyHostToDevice);
 
-	gpu::GpuMat gpuCorrespCountMat(corresps.size(), CV_32SC1, Scalar(0));
-
-	// int correspCount = 0;
 	dim3 blockDim (TPB_X, TPB_Y);
 	dim3 gridDim (GRID_COLS(gpuDepth1.cols), GRID_ROWS(gpuDepth1.rows));
 
 	gpuComputeCorrespKernel<<<gridDim, blockDim>>> (gpuDepth0, gpuDepth1, gpuTexturedMask1, 
-			corresps, gpuKRK_inv_ptr, gpuKt_ptr, gpuCorrespCountMat, maxDepthDiff);
-	cudaDeviceSynchronize();
+			corresps, gpuKRK_inv_ptr, gpuKt_ptr, gpuCorrespCount, maxDepthDiff);
 
-	/*
-	Mat correspCountMat;
-	gpuCorrespCountMat.download(correspCountMat);
-	cout << "inside gpu computeCorresp,:  " << correspCountMat << endl;
-	*/
-	return gpuCorrespCountMat;
+	cudaMemcpy(&correspCount, gpuCorrespCount, sizeof(int), cudaMemcpyDeviceToHost);
+
+	return correspCount;
 }
 
 __global__ void gpuComputeKsiKernel (const gpu::PtrStepSz<uchar> gpuLevelImage0, const gpu::PtrStepSz<uchar> gpuLevelImage1,
-									 const gpu::PtrStepSz<int> gpuCorrespCountMat, const gpu::PtrStepSz<int2> corresps,
-									 gpu::PtrStepSz<float> gpuSigmaMat) {
+									 int correspCount, const gpu::PtrStepSz<int2> corresps, gpu::PtrStepSz<float> gpuSigmaMat) {
+
 	int x = threadIdx.x + blockIdx.x * blockDim.x;
-	int y = threadIdx.y + blockIdx.y * blockDim.y;
+	//int y = threadIdx.y + blockIdx.y * blockDim.y;
 
-	if (x >= gpuLevelImage0.cols || y >= gpuLevelImage0.rows)
+	if (x >= correspCount)
 		return;
+
+	int2 corrKey = corresps(x, 0);
+	int2 corr = corresps(x, 1);
 	
-	int2 c = corresps(y,x);
-	if (c.x == -1 || c.y == -1) {
-		// gpuSigmaMat(y,x) = 0.f;
-		return;
-	}
-
-	float diff = gpuLevelImage0(y,x) - gpuLevelImage1(c.y, c.x);
-	gpuSigmaMat(y,x) = diff * diff;
-	// gpuSigmaMat(y,x) = gpuLevelImage0(y,x);
+	float diff = gpuLevelImage0(corrKey.y, corrKey.x) - gpuLevelImage1(corr.y, corr.x);
+	
+	gpuSigmaMat(x,0) = diff*diff;
 }
 
 __device__ void gpuComputeRigidBody(double* C, double dIdx, double dIdy, 
@@ -416,34 +450,29 @@ __device__ void gpuComputeRigidBody(double* C, double dIdx, double dIdy,
 
 __global__ void gpuComputeKsiKernelRigidBody (const gpu::PtrStepSz<uchar> gpuLevelImage0, 
 			const gpu::PtrStepSz<uchar> gpuLevelImage1, const gpu::PtrStepSz<float3> gpuLevelCloud0, 
-			double sobelScale, double * gpuC_ptr, double * gpu_dI_dt_ptr, const gpu::PtrStepSz<int2> corresps,
+			double sobelScale, gpu::PtrStepSz<double> C, gpu::PtrStepSz<double> dI_dt, const gpu::PtrStepSz<int2> corresps,
 			const gpu::PtrStepSz<float> gpuLevel_dI_dx1, const gpu::PtrStepSz<float> gpuLevel_dI_dy1, 
-			double sigma, int* gpuPointCountPtr, double fx, double fy) {
+			double sigma, double fx, double fy, int correspCount) {
 	int x = threadIdx.x + blockIdx.x * blockDim.x;
-	int y = threadIdx.y + blockIdx.y * blockDim.y;
 	
-	if ( x >= gpuLevelImage0.cols || y >= gpuLevelImage0.rows)
+	if (x >= correspCount)
 		return;
 
-	int2 c = corresps(y, x);
-	if (c.x == -1 || c.y == -1)
-		return;
+	int2 corrKey = corresps(x, 0);
+	int2 corr = corresps(x, 1);
 
-	// double diff = fabsf(gpuLevelImage0(y,x) - gpuLevelImage1(c.y,c.x));
-	double diff = gpuLevelImage1(c.y,c.x) - gpuLevelImage0(y,x);
+	double diff = gpuLevelImage1(corr.y, corr.x) - gpuLevelImage0(corrKey.y, corrKey.x);
 	double w = sigma + fabs(diff);
 	w = w > DBL_EPSILON ? 1./w : 1;
 
-	int threadPointCount = atomicAdd (gpuPointCountPtr, 1);
+	double dIdx = w * sobelScale * gpuLevel_dI_dx1(corr.y, corr.x);
+	double dIdy = w * sobelScale * gpuLevel_dI_dy1(corr.y, corr.x);
 
-	double dIdx = w * sobelScale * gpuLevel_dI_dx1(c.y,c.x);
-	double dIdy = w * sobelScale * gpuLevel_dI_dy1(c.y,c.x);
-
-	float3 p3d = gpuLevelCloud0(y, x);
+	float3 p3d = gpuLevelCloud0(corrKey.y, corrKey.x);
 	
-	gpuComputeRigidBody(&gpuC_ptr[threadPointCount * 6], dIdx, dIdy, p3d, fx, fy);
+	gpuComputeRigidBody(C.ptr(x), dIdx, dIdy, p3d, fx, fy);
 
-	gpu_dI_dt_ptr[threadPointCount] = w * diff;
+	*dI_dt.ptr(x) = w * diff;
 
 }
 
@@ -461,68 +490,41 @@ bool solveSystem( const Mat& C, const Mat& dI_dt, double detThreshold, Mat& ksi)
 	return true;
 }
 
-bool gpuComputeKsi (const gpu::GpuMat& gpuLevelImage0, const gpu::GpuMat&  gpuLevelCloud0, 
+bool gpuComputeKsi (const gpu::GpuMat& gpuLevelImage0, const gpu::GpuMat&  gpuLevelCloud0,
 					const gpu::GpuMat& gpuLevelImage1, const gpu::GpuMat& gpuLevel_dI_dx1,
 					const gpu::GpuMat& gpuLevel_dI_dy1, const gpu::GpuMat& gpuCorresps,
 					int correspCount, double fx, double fy, double sobelScale,
-					double determinantThreshold, Mat& ksi, const gpu::GpuMat& gpuCorrespCountMat,
-					gpu::GpuMat& corresps) {
+					double determinantThreshold, Mat& ksi, gpu::GpuMat& corresps) {
 
-	gpu::GpuMat gpuSigmaMat(gpuLevelImage0.size(), CV_32FC1, Scalar(0));
+	gpu::GpuMat gpuSigmaMat(correspCount, 1, CV_32FC1);
 
-	dim3 blockDim (TPB_X, TPB_Y);
-	dim3 gridDim (GRID_COLS(gpuLevelImage0.cols), GRID_ROWS(gpuLevelImage0.rows));
+	dim3 blockDim (THREADS_PER_BLOCK);
+	dim3 gridDim ((correspCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
-	gpuComputeKsiKernel<<<gridDim, blockDim>>> (gpuLevelImage0, gpuLevelImage1, gpuCorrespCountMat,
+	gpuComputeKsiKernel<<<gridDim, blockDim>>> (gpuLevelImage0, gpuLevelImage1, correspCount,
 												corresps, gpuSigmaMat);
-    cudaDeviceSynchronize();
 
-	Mat cpuSigmaMat;
-	gpuSigmaMat.download(cpuSigmaMat);
-
-/*
-	gpuLevelImage0.download(cpuSigmaMat);
-	cout << "gpuimage0 values:  " << cpuSigmaMat << endl;
-*/
 	Scalar scalarSigma = gpu::sum(gpuSigmaMat);
 	double sigma = scalarSigma[0];
 	sigma = sqrt(sigma/correspCount);
 
-	Mat C (correspCount, 6, CV_64FC1);
-	Mat dI_dt (correspCount, 1, CV_64FC1);
-	double * C_ptr = reinterpret_cast<double *>(C.ptr());
-	double * dI_dt_ptr = reinterpret_cast<double *>(dI_dt.ptr());
-	
-	int pointCount = 0;
+	gpu::GpuMat C(correspCount, 6, CV_64FC1);
+	gpu::GpuMat dI_dt(correspCount, 1, CV_64FC1);
+
 	bool solutionExist;
-	
-	double* gpuC_ptr;
-	cudaMalloc((void**)&gpuC_ptr, correspCount * 6 * sizeof(double));
-	cudaMemcpy(gpuC_ptr, C_ptr, correspCount * 6 * sizeof(double), cudaMemcpyHostToDevice);
 
-	double* gpu_dI_dt_ptr;
-	cudaMalloc((void**)&gpu_dI_dt_ptr, correspCount * sizeof(double));
-	cudaMemcpy(gpu_dI_dt_ptr, dI_dt_ptr, correspCount * sizeof(double), cudaMemcpyHostToDevice);
-	
-	dim3 blockDim1 (TPB_X, TPB_Y);
-	dim3 gridDim1 (GRID_COLS(gpuLevelImage0.cols), GRID_ROWS(gpuLevelImage0.rows));
+	gpuComputeKsiKernelRigidBody<<<gridDim, blockDim>>> (gpuLevelImage0, gpuLevelImage1, 
+			gpuLevelCloud0,	sobelScale, C, dI_dt, corresps, 
+			gpuLevel_dI_dx1, gpuLevel_dI_dy1, sigma, fx, fy, correspCount);
 
-	int* gpuPointCountPtr;
-	cudaMalloc((void**)&gpuPointCountPtr, sizeof(int));
-	cudaMemcpy(gpuPointCountPtr, &pointCount, sizeof(int), cudaMemcpyHostToDevice);
+	Mat cpuC;
+	C.download(cpuC);
 
-	gpuComputeKsiKernelRigidBody<<<gridDim1, blockDim1>>> (gpuLevelImage0, gpuLevelImage1, 
-			gpuLevelCloud0,	sobelScale, gpuC_ptr, gpu_dI_dt_ptr, corresps, 
-			gpuLevel_dI_dx1, gpuLevel_dI_dy1, sigma, gpuPointCountPtr, fx, fy);
-	cudaDeviceSynchronize();
-
-	cudaMemcpy(dI_dt_ptr, gpu_dI_dt_ptr, correspCount * sizeof(double), cudaMemcpyDeviceToHost);
-	cudaMemcpy(C_ptr, gpuC_ptr, correspCount * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+	Mat cpu_dI_dt;
+	dI_dt.download(cpu_dI_dt);
 
 	Mat sln;
-	solutionExist = solveSystem( C, dI_dt, determinantThreshold, sln );
-	// cout << "something pls " << C << endl;
-	// cout << "more pls " << dI_dt << endl;
+	solutionExist = solveSystem( cpuC, cpu_dI_dt, determinantThreshold, sln );
 
 	if (solutionExist) {
 		ksi.create(6, 1, CV_64FC1);
@@ -562,8 +564,8 @@ bool RGBDOdometry418( cv::Mat& Rt, const Mat& initRt,
     Mat depth0 = _depth0.clone(),
         depth1 = _depth1.clone();
 
-	TickMeter tm;
-	tm.start();
+	Mat resultRt = initRt.empty() ? Mat::eye(4,4,CV_64FC1) : initRt.clone();
+
 	/*#########################################################################
 	   Asserts
 	   Check if the input images are of the right formats
@@ -590,45 +592,46 @@ bool RGBDOdometry418( cv::Mat& Rt, const Mat& initRt,
                minGradientMagnitudes.size() == iterCounts.size() );
     CV_Assert( initRt.empty() || (initRt.type()==CV_64FC1 && initRt.size()==Size(4,4) ) );
 
-	gpu::CudaMem cudaMem;
-	cout << "Can map host memory " << cudaMem.canMapHostMemory() << endl;
-
 	/*#########################################################################
 	   Preprocess depth images
 	   Checks if the depth values are in a valid range
 	#########################################################################*/
 
 	// Grayscale images in GPU memory
-	gpu::GpuMat gpuImage0, gpuImage1;
-	gpuImage0.upload(image0);
-	gpuImage1.upload(image1);
+	unsigned char *image0ptr;
+	cudaMalloc((void**)&image0ptr, image0.rows*image0.cols*sizeof(unsigned char));
+	unsigned char *image1ptr;
+	cudaMalloc((void**)&image1ptr, image1.rows*image1.cols*sizeof(unsigned char));
 
 	// Depth images in GPU memory
-	gpu::GpuMat gpuDepth0, gpuDepth1;
-	gpuDepth0.upload(depth0);
-	gpuDepth1.upload(depth1);
+	float *depth0ptr;
+	cudaMalloc((void**)&depth0ptr, depth0.rows*depth0.cols*sizeof(float));
 
-	// Valid masks in GPU memory
-	gpu::GpuMat gpuValidMask0, gpuValidMask1;
-	gpuValidMask0.upload(validMask0);
-	gpuValidMask1.upload(validMask1);
+	float *depth1ptr;
+	cudaMalloc((void**)&depth1ptr, depth1.rows*depth1.cols*sizeof(float));
 
-	// call the GPU depth preprocessor
-	gpuPreprocessDepth (gpuDepth0, gpuDepth1, gpuValidMask0, gpuValidMask1, minDepth, maxDepth);
+	cudaMemcpy(image0ptr, image0.ptr(), image0.rows*image0.cols*sizeof(unsigned char), cudaMemcpyHostToDevice);
+	cudaMemcpy(image1ptr, image1.ptr(), image1.rows*image1.cols*sizeof(unsigned char), cudaMemcpyHostToDevice);
+	cudaMemcpy(depth0ptr, depth0.ptr(), depth0.rows*depth0.cols*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(depth1ptr, depth1.ptr(), depth1.rows*depth1.cols*sizeof(float), cudaMemcpyHostToDevice);
 
-	/*#########################################################################
-	   Build pyramids
-	   Builds coarse to fine pyramids of images, depth maps and camera matrices
-	#########################################################################*/
+	gpu::GpuMat gpuImage0(image0.size(), CV_8UC1, image0ptr);
+	gpu::GpuMat gpuImage1(image1.size(), CV_8UC1, image1ptr);
+	gpu::GpuMat gpuDepth0(depth0.size(), CV_32FC1, depth0ptr);
+	gpu::GpuMat gpuDepth1(depth1.size(), CV_32FC1, depth1ptr);
+
+	gpuPreprocessDepth(gpuDepth0, gpuDepth1, minDepth, maxDepth);
 
 	// Vectors of GpuMats for the pyramids
 	vector<gpu::GpuMat> gpuPyramidImage0, gpuPyramidImage1,
 		gpuPyramidDepth0, gpuPyramidDepth1, gpuPyramid_dI_dx1, gpuPyramid_dI_dy1,
-		gpuPyramidTexturedMask1, gpuPyramidCameraMatrix;
+		gpuPyramidTexturedMask1, gpuPyramidCloud0;//, gpuPyramidCameraMatrix;
+
+	vector<Mat> pyramidCameraMatrix;
 
 	// Camera matrix in GPU memory
 	gpu::GpuMat gpuCameraMatrix;
-	gpuCameraMatrix.upload(cameraMatrix);
+	// gpuCameraMatrix.upload(cameraMatrix);
 
 	// Sobel parameters
 	const int sobelSize = 3;
@@ -653,12 +656,7 @@ bool RGBDOdometry418( cv::Mat& Rt, const Mat& initRt,
 				   sobelSize, sobelScale, *minGradientMagnitudesPtr, 
 				   gpuPyramidImage0, gpuPyramidDepth0, gpuPyramidImage1, gpuPyramidDepth1,
 				   gpuPyramid_dI_dx1, gpuPyramid_dI_dy1, gpuPyramidTexturedMask1, 
-				   gpuPyramidCameraMatrix, cameraMatrix);
-
-	/*#########################################################################
-	   Motion estimation
-	   From coarse to fine, refines estimate of camera motion
-	#########################################################################*/
+				   pyramidCameraMatrix, cameraMatrix, minDepth, maxDepth, gpuPyramidCloud0);//, pyramidCameraMatrix);
 
 	vector<int> defaultIterCounts;
 	vector<int> const* iterCountsPtr = &iterCounts;
@@ -672,108 +670,61 @@ bool RGBDOdometry418( cv::Mat& Rt, const Mat& initRt,
 		iterCountsPtr = &defaultIterCounts;
 	}
 
-	Mat resultRt = initRt.empty() ? Mat::eye(4,4,CV_64FC1) : initRt.clone();
-
-	tm.stop();
-	cout << "Before loop time " << tm.getTimeSec() << " sec." << endl;
-
-
-	gpu::GpuMat gpuCurrRt;
 	Mat currRt;
 	Mat ksi;
-
 	for (int level = (int)iterCountsPtr->size() - 1; level >= 0; level--) {
-
 		Mat levelCameraMatrix;
-		gpuPyramidCameraMatrix[level].download(levelCameraMatrix);
+		levelCameraMatrix = pyramidCameraMatrix[level];
 
 		const gpu::GpuMat& gpuLevelImage0 = gpuPyramidImage0[level];
 		const gpu::GpuMat& gpuLevelDepth0 = gpuPyramidDepth0[level];
 
-		gpu::GpuMat gpuLevelCloud0;
-		gpuCvtDepth2Cloud (gpuPyramidDepth0[level], gpuLevelCloud0, levelCameraMatrix);
-
+		const gpu::GpuMat& gpuLevelCloud0 = gpuPyramidCloud0[level];
 		const gpu::GpuMat& gpuLevelImage1 = gpuPyramidImage1[level];
 		const gpu::GpuMat& gpuLevelDepth1 = gpuPyramidDepth1[level];
+
+		Mat levelCloud0(gpuPyramidCloud0[level].size(), CV_32FC3);
+		gpuPyramidCloud0[level].download(levelCloud0);
+
 		const gpu::GpuMat& gpuLevel_dI_dx1 = gpuPyramid_dI_dx1[level];
 		const gpu::GpuMat& gpuLevel_dI_dy1 = gpuPyramid_dI_dy1[level];
 
 		CV_Assert(gpuLevel_dI_dx1.type() == CV_32F);
 		CV_Assert(gpuLevel_dI_dy1.type() == CV_32F);
 
-		// Mat tempDepth;
-		// gpuLevelDepth0
-		// cout << "depth image 0: " << endl << 
-
 		const double fx = levelCameraMatrix.at<double>(0,0);
 		const double fy = levelCameraMatrix.at<double>(1,1);
 		const double determinantThreshold = 1e-6;
-
-		gpu::GpuMat corresps(gpuLevelImage0.size(), gpuLevelImage0.type());
+		gpu::GpuMat corresps;
 
 		for (int iter = 0; iter < (*iterCountsPtr)[level]; iter++) {
-			gpu::GpuMat gpuCorrespCountMat = gpuComputeCorresp(levelCameraMatrix, levelCameraMatrix.inv(), 
-					resultRt.inv(DECOMP_SVD), gpuLevelDepth0, gpuLevelDepth1, 
+			int correspCount = gpuComputeCorresp(levelCameraMatrix, levelCameraMatrix.inv(),
+					resultRt.inv(DECOMP_SVD), gpuLevelDepth0, gpuLevelDepth1,
 					gpuPyramidTexturedMask1[level], maxDepthDiff, corresps);
 
-			/*
-			Mat corrMat;
-			corresps.download(corrMat);
-			cout << "Corresps " << corrMat << endl;
-			*/
-
-			int correspCount = gpu::countNonZero(gpuCorrespCountMat);
-		
-			if (correspCount == 0)
+			if (correspCount == 0) {
 				break;
+			}
 
-			bool solutionExist = gpuComputeKsi (gpuLevelImage0, gpuLevelCloud0, gpuLevelImage1,
-												gpuLevel_dI_dx1, gpuLevel_dI_dy1, corresps, correspCount,
-												fx, fy, sobelScale, determinantThreshold, ksi, 
-												gpuCorrespCountMat, corresps);
+			bool solutionExist = gpuComputeKsi (gpuLevelImage0, gpuLevelCloud0, gpuLevelImage1, 
+				   gpuLevel_dI_dx1, gpuLevel_dI_dy1, corresps, correspCount,
+				   fx, fy, sobelScale, determinantThreshold, ksi, corresps);
 
-			if (!solutionExist)
+			if (!solutionExist) {
 				break;
+			}
 
 			computeProjectiveMatrix(ksi, currRt);
-			
+
 			resultRt = currRt * resultRt;
-#if SHOW_DEBUG_IMAGES
-            std::cout << "currRt " << currRt << std::endl;
-			Mat levelImage0, levelDepth0, levelImage1, levelDepth1;
-			gpuLevelImage0.download(levelImage0);
-			gpuLevelImage1.download(levelImage1);
-			gpuLevelDepth0.download(levelDepth0);
-			gpuLevelDepth1.download(levelDepth1);
-
-            Mat warpedImage0;
-            const Mat distCoeff(1,5,CV_32FC1,Scalar(0));
-            warpImage<uchar>( levelImage0, levelDepth0, resultRt, levelCameraMatrix, distCoeff, warpedImage0 );
-
-            imshow( "im0", levelImage0 );
-            imshow( "wim0", warpedImage0 );
-            imshow( "im1", levelImage1 );
-            waitKey();
-#endif
 
 		}
-
-	}
-/*
-	for (int i=0; i<gpuPyramidImage0.size(); i++) {
-		Mat dummyMat;
-		gpuPyramid_dI_dy1[i].download(dummyMat);
-		imshow("dummy", dummyMat);
-		waitKey();
 	}
 
-    Mat dummyDepth;
-	gpuDepth0.download(dummyDepth);
-
-	imshow("Original", depth0);
-	imshow("Dummy", dummyDepth);
-	waitKey();
-*/
+	gpuImage0.release();
+	gpuImage1.release();
+	gpuDepth0.release();
+	gpuDepth1.release();
 
 	Rt = resultRt;
 
