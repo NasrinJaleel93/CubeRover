@@ -16,14 +16,14 @@
 
 <h3>
 <a id="rather-drive-stick" class="anchor" href="#rather-drive-stick" aria-hidden="true"><span class="octicon octicon-link"></span></a>Software</h3>
-<p>We use OpenCV’s implementation of RGB-D camera tracking found in the contrib module as the basis for our parallel implementation, as well as for performance and correctness checking. We also use a few other libraries like libfreenect to interface the Kinect with OpenCV.
+<p>We use OpenCV’s implementation of RGB-D camera tracking found in the <font face = "Courier New">contrib</font> module as the basis for our parallel implementation, as well as for performance and correctness checking. We also use a few other libraries like <font face = "Courier New">libfreenect</font> to interface the Kinect with OpenCV.
 </p>
 
 <h3>
 <a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Visual Odometry</h3>
 
 <p>
-  In Computer Vision, visual odometry (we’ll call this camera tracking from here) is the process of determining the position and orientation of a robot by analyzing the associated camera images. In our algorithm we get as input a stream of RGB and depth images from the Kinect, and we try to estimate the camera motion between each pair of frames.
+  In Computer Vision, visual odometry (we’ll call this <i>camera tracking</i> from here) is the process of determining the position and orientation of a robot by analyzing the associated camera images. In our algorithm we get as input a stream of RGB and depth images from the Kinect, and we try to estimate the camera motion between each pair of frames.
 </p>
 
 <h3>
@@ -53,17 +53,95 @@ Another goal for us was to be able to let our code merge seamlessly with OpenCV�
 
 <p>
   The first step of the algorithm involves processing RGB and depth images. 
-<font face = "Courier New">gpuPreprocessDepth()</font> processes every depth image and only depths that range in a certain threshold are considered for computation. This is done to avoid computing the shift in depths of pixels that are very far away since their movement is significantly lower compared to the ones that are closer to the camera. We have launched a Cuda kernel to do this since a single instruction is executed in parallel across all the pixels of the image. This involves a slight bit of divergence due to the threshold check. We assign Nan values to all the pixels whose depths are either negative or greater than a certain maximum depth.
+</p>
+<p>
+<font face = "Courier New">gpuPreprocessDepth()</font> processes every depth image and only depths that range in a certain threshold are considered for computation. This is done to avoid computing the shift in depths of pixels that are very far away since their movement is significantly lower compared to the ones that are closer to the camera. We have launched a Cuda kernel to do this since a single instruction is executed in parallel across all the pixels of the image. This involves a slight bit of divergence due to the threshold check. We assign <font face = "Courier New">Nan</font> values to all the pixels whose depths are either negative or greater than a certain maximum depth.
 </p>
 
 <p>
-gpuBuildPyramids() processes all the rgb images, i.e., the images captured at time t and the images captured at time t+1. The main functionality here is to find large and small features in the images and compare them against each other . Large image features can be computed by convolving the entire image with a Gaussian kernel and downsampling the image. Similarly, the smaller image features are estimated by convolving the original images with a Gaussian kernel [r]. In other words, downsampling the images to store a pyramid of images (different sizes of the downsampled/smoothened images belong to different pyramid levels)
+<font face = "Courier New">gpuBuildPyramids()</font> processes all the rgb images, i.e., the images captured at time <font face = "Courier New">t</font> and the images captured at time <font face = "Courier New">t+1</font>. The main functionality here is to find large and small features in the images and compare them against each other . Large image features can be computed by convolving the entire image with a Gaussian kernel and downsampling the image. Similarly, the smaller image features are estimated by convolving the original images with a Gaussian kernel. In other words, downsampling the images to store a pyramid of images (different sizes of the downsampled/smoothened images belong to different pyramid levels)
 </p>
 
 <p>
-gpuSobel() calculates the gradient images of every downsampled pyramid images of images taken at time t+1. Sobel filter [r] is used in computing the partial derivative along both the x and the y axis. This is done by convolving every image pixel with a 2D kernel given by the matrices:
+<font face = "Courier New">gpuSobel()</font> calculates the gradient images of every downsampled pyramid images of images taken at time <font face = "Courier New">t+1</font>. Sobel filter is used in computing the partial derivative along both the x and the y axis. This is done by convolving every image pixel with a 2D kernel given by the matrices:
+</p>
+ <div class = "box" align= "center">
+    <img src="img/sobel.png" />
+  </div>
+  <p>
+  	Gx and Gy are the kernels used to compute partial derivatives along x-axis and y-axis respectively. 
+  </p>
+  <p>
+At this point, the gradient around every pixel is checked to only consider those frames whose gradient is higher than a certain threshold. This is denoted by <font face = "Courier New">gpuTexturedMask</font>.
+</p>
+<p>
+<font face = "Courier New">gpuBuildPyramids() , gpuSobel()</font> and computing the , happen in serial for every image pyramid, but each of the three operations is done pixel-wise on the image pyramid. To avoid the overhead caused due to multiple kernel launches, they are merged into a single kernel launch denoted by <font face = "Courier New">gpuSobelKernel()</font>.
+</p>
+<p>
+The following are the performance results for <font face = "Courier New">gpuPreprocessDepthKernel()</font> and <font face = "Courier New">gpuSobelKernel()</font> kernel calls.
+  </p>
+   <div class = "box">
+    <img src="img/preprocess.png" />
+  </div>
+  <p>
+  	It can be observed that the parallel implementation gives a speedup of almost 3x. There is a slight amount of divergence in both the kernel calls. 
+  </p>
+
+<h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Compute Point Cloud</h3>
+<p>Each pixel in the image captured at time <font face = "Courier New">t+1</font> is transformed along with the depth value at that pixel to get a 3D point cloud of that image, (world coordinates). This computation is done using Camera Matrix (an intrinsic property of the camera, the computation of which is called Camera Calibration). Since the same SIMD instruction is applied to every pixel in the image, this is parallelized by using another kernel launch. The performance of this function is really high because of the lack of any divergence in the kernel call. This is done in the <font face = "Courier New">gpuCvtDepth2CloudKernel()</font> kernel call.
 </p>
 
+<h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Computing Correspondences</h3>
+<p><font face = "Courier New">gpuComputeCorresp()</font> launches the kernel, <font face = "Courier New">gpuComputeCorrespKernel()</font> which compute the correspondences between two consecutive frames by:
+<ol>
+	<li> Inverse-projecting the image coordinates of the image taken at time <font face = "Courier New">t</font> to their 3D points, the 3D point cloud obtained from <font face = "Courier New">gpuCvtDepth2Cloud()</font> function call.</li>
+	<li>Transforming the 3D points using the current estimate of the motion parameters.
+	</li>
+	<li>Projecting the transformed 3D points onto the second image. We now have two “second images”, so to say: an estimate of what we think the second image is, and the actual second images. The correspondences are then calculated by taking the difference of the depths between the transformed point in the original and the estimated image. 
+	</li>
+</ol> 
+The above three computations are done in the <font face = "Courier New">gpuComputeCorrespKernel()</font> kernel call. 
+The number of correspondences in the images are of the order of 20,000 among the 300,000 image pixels. After this point, the computations are done purely on the correspondences. To maximize the parallelism and minimize computational divergence when blocks of threads ran over contiguous chunks of the image, these correspondences are stored into a dense array and the corresponding kernel calls are launched only on these correspondences, <font face = "Courier New">corresps</font>. This was an atomic operation which meant sacrificing parallelism in <font face = "Courier New">gpuComputeCorrespKernel()</font> kernel but this approach proved more efficient in the improving the overall performance.
+</p>
+<h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Compute Ksi -<font face = "Courier New"> gpuComputeKsi()</font> </h3>
+<p>Ksi is error difference between the warp applied on image taken at time <font face = "Courier New">t+1</font>,  and the image taken at time <font face = "Courier New">t</font>. At every iteration, ksi is further minimized. This is done by computing the camera’s rotation and translation, denoted by a 4x4 matrix. This is denoted by <font face = "Courier New">Rt</font>, it is estimated and updated at each iteration. Hence this part of the code cannot be parallelized. 
+</p>
+<p>
+This computation involves two kernel launches, <font face = "Courier New">gpuComputeKsiRigidBodyKernel()</font> and <font face = "Courier New">gpuComputeKsiKernel()</font>. These two kernel calls only operate on corresps evaluated in the previous section and hence they have less computational divergence as compared to storing an image with valid and invalid correspondences, where for every pixel, we check if there is a valid correspondence.
+</p>
+<p>
+In <font face = "Courier New">gpuComputeKsiKernel()</font>, the standard deviation <font face = "Courier New">sigma</font> is calculated by iterating through <font face = "Courier New">corresps</font> . The next kernel call uses sigma to compute rigid body transformation kernel call. This kernel call has significantly less divergence and shows better performance because it is parallelized over the array elements of <font face = "Courier New">corresps</font>.
+</p>
+<p>
+The following part of the code, <font face = "Courier New">solveSystem, computeProjectiveMatrix </font> is executed on the CPU because the input data to these functions is very small  in size and the kernel launch and thread overhead is extremely higher than running the two functions directly on the CPU. 
+</p>
+
+<h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Results -<font face = "Courier New"> gpuComputeKsi()</font> </h3>
+ <div class = "box">
+    <img src="img/graphs.png" />
+  </div>
+   <div class = "box">
+    <img src="img/overallgraph.png" />
+  </div>
+<p>
+As it can be observed from the results, most kernels had some amount of divergence which affected the speed up. The CubeRover moves at 15cm/sec. The image processing rate for our implementation is 3Hz which is sufficient in the case of our project. However, there can be more speedup that can be achieved by implementing a standalone version of our algorithm to avoid data transfers between CPU and GPU memory. This will be detailed shortly. 
+Due to the iterative nature of our algorithm, the convergence of the motion cannot be parallelized any further. Also, due to the serial chunks of code that are present in the algorithm in between kernel launches, scope for parallelism is further hampered. This would need us to improve the computer vision algorithm that would avoid this bottleneck.  
+</p>
+<h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Scope for Improvement </h3>
+<p><i>Unified Memory</i></p>
+<p>
+TegraK1 comes with Unified Memory feature with CUDA 6, which is not used in our algorithm because we created a parallel ‘plug in’ for openCV RGBD Odometry code. The input data used by openCV is in the form of Mat datatype. This datatype has a corresponding datatype on the GPU known as GpuMat, which has to be used in place of the Mat datatype during kernel launches. Hence, we could not avoid the overhead from cudaMemcpy. 
+</p>
+<p>
+<i>CUDA Streams</i></p>
+<p>
+CUDA streams facilitate parallel execution of kernels during data transfer. This is a very useful feature in situations with huge data. The CUDA streams were not useful in our problem because there was no significant computation that was being done during the data transfer because the size of the data is not large. 
+</p>
 <h3>
 <a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>References<a name="ref"></a></h3>
 <ol type="1">
