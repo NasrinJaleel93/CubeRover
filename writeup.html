@@ -38,81 +38,31 @@ In dense tracking, we calculate the correspondences between two consecutive fram
 Most algorithms that are available in real-time today use sparse feature detection. We have implemented dense feature tracking in our algorithm to exploit the parallelism available on the Tegra and achieve better accuracy.
 </p>
 <h3>
-<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Stretch Goal</h3>
-<p>As mentioned earlier, depth map estimation is a non-trivial problem [<a href="#ref">5</a>] [<a href="#ref">1</a>]. In the absence of an RGB-D sensor in the CubeRover, we would have to generate depth maps using monocular camera only. Our stretch goal would be to implement a depth map estimation algorithm and GPU/CPU parallelize it.</p>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Challenges</h3>
+<p>Ideally, we’d like to get the algorithm in real-time. Real-time camera tracking would make it possible to perform odometry not only in fast-moving robots, but also in hand-held camera systems. OpenCV’s implementation takes about 750 milliseconds to estimate the rotation and translation between two frames. Almost no application can use their algorithm to run tracking in real-time.
+</p>
 
+<p>
+The algorithm refines motion parameters iteratively. This creates a lot of dependencies between different parts of the code, and makes large parts of the code inherently serial. As we shall see in future sections, not every parallelizable part of the algorithm is embarrassingly so. There are a few places where SIMD divergence considerations (among other things) force us to sacrifice parallelism in the code. Any simple filter or mask that only considers a scattering of pixels across the image already poses a difficulty in terms of divergent computation.
+</p>
+<p>
+Another goal for us was to be able to let our code merge seamlessly with OpenCV’s existing RGB-D odometry API.</p>
+</p>
 <h3>
-<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Schedule</h3>
+<a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>Preprocessing Images</h3>
 
-<table class="pure-table pure-table-horizontal">
-    <thead>
-        <tr bgcolor="#f0f0f0">
-            <th>#</th>
-            <th>Date</th>
-            <th>Objective</th>
-            <th>Description</th>
-        </tr>
-    </thead>
+<p>
+  The first step of the algorithm involves processing RGB and depth images. 
+<font face = "Courier New">gpuPreprocessDepth()</font> processes every depth image and only depths that range in a certain threshold are considered for computation. This is done to avoid computing the shift in depths of pixels that are very far away since their movement is significantly lower compared to the ones that are closer to the camera. We have launched a Cuda kernel to do this since a single instruction is executed in parallel across all the pixels of the image. This involves a slight bit of divergence due to the threshold check. We assign Nan values to all the pixels whose depths are either negative or greater than a certain maximum depth.
+</p>
 
-    <tbody>
-        <tr>
-            <td>1</td>
-            <td nowrap= "nowrap">April 4</td>
-            <td>Setup the working environment </td>
-            <td>Set up the tegra and kinect. Install the required software packages</td>
-        </tr>
+<p>
+gpuBuildPyramids() processes all the rgb images, i.e., the images captured at time t and the images captured at time t+1. The main functionality here is to find large and small features in the images and compare them against each other . Large image features can be computed by convolving the entire image with a Gaussian kernel and downsampling the image. Similarly, the smaller image features are estimated by convolving the original images with a Gaussian kernel [r]. In other words, downsampling the images to store a pyramid of images (different sizes of the downsampled/smoothened images belong to different pyramid levels)
+</p>
 
-        <tr bgcolor="#f0f0f0">
-            <td>2</td>
-            <td nowrap= "nowrap">April 6</td>
-            <td>Initial testing of the benchmarked software</td>
-            <td></td>
-        </tr>
-
-        <tr>
-            <td>3*</td>
-            <td nowrap="nowrap">April 20</td>
-            <td>Visual Odometry GPU Implementation</td>
-            <td></td>
-        </tr>
-
-        <tr bgcolor="#f0f0f0">
-            <td>4*</td>
-            <td nowrap="nowrap">April 25</td>
-            <td>Visual Odometry CPU Implementation</td>
-            <td></td>
-        </tr>
-
-        <tr>
-            <td>5</td>
-            <td nowrap="nowrap">April 26 - May 1</td>
-            <td>Exam Preparation</td>
-            <td></td>
-        </tr>
-
-        <tr bgcolor="#f0f0f0">
-            <td>6</td>
-            <td nowrap="nowrap">May 2 - May 5</td>
-            <td>Integration</td>
-            <td>Integrating all the modules and testing for correctness and performance. Also, testing on different test data sets</td>
-        </tr>
-
-        <tr>
-            <td>7</td>
-            <td nowrap="nowrap">May 6 - May 7</td>
-            <td>Test for energy consumption</td>
-            <td></td>
-        </tr>
-
-        <tr bgcolor="#f0f0f0">
-            <td>8</td>
-            <td nowrap="nowrap">May 7 - May 11</td>
-            <td>Final Product</td>
-            <td>Final report, presentation and an attempt at the stretch goal</td>
-        </tr>
-    </tbody>
-</table>
-<font size = "3"> <i> *Revised schedule</i></font>
+<p>
+gpuSobel() calculates the gradient images of every downsampled pyramid images of images taken at time t+1. Sobel filter [r] is used in computing the partial derivative along both the x and the y axis. This is done by convolving every image pixel with a 2D kernel given by the matrices:
+</p>
 
 <h3>
 <a id="authors-and-contributors" class="anchor" href="#authors-and-contributors" aria-hidden="true"><span class="octicon octicon-link"></span></a>References<a name="ref"></a></h3>
